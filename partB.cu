@@ -16,7 +16,7 @@ const int H[L-1] = {2048, 2048, 2048};
 #define IDX(Y,X,N) ((((Y) * (N)) + (X)))
 
 #define TILE_SIZE 32
-#define DEBUG_PRINT
+// #define DEBUG_PRINT
 
 __global__ void matmul(float* A, float* B, float* C, int P, int Q, int R, bool aTrans=false, bool bTrans=false) {
     // A is a PxQ matrix
@@ -54,8 +54,10 @@ __global__ void matAdd(float *A, float* B, float *C, int numCols) {
     C[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] = A[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] + B[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)];
 }
 
-__global__ void matSub(float *A, float* B, float *C, int numCols) {
-    C[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] = A[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] - B[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)];
+__global__ void bpInit(float *A, float* B, float *C, int numCols, int numRows) {
+    C[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] = 2 * (A[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] - B[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)]);
+    C[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] = C[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)]/numRows;
+    C[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] = C[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)]/numCols;
 }
 
 __global__ void matVecAdd(float *A, float* B, float *C, int numCols) {
@@ -68,10 +70,22 @@ __global__ void matVecSub(float *A, float* B, float *C, int numCols) {
     C[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] = A[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] - B[blockIdx.x * blockDim.x + threadIdx.x];
 }
 
+__global__ void biasGradientGPU(float *dB, float *dZ, int outDim, int batchSize) {
+    // Assumption: 1D grid
+    dB[blockIdx.x * blockDim.x + threadIdx.x] = 0;
+    for (int i=0; i < batchSize; i++) {
+        dB[blockIdx.x * blockDim.x + threadIdx.x] += dZ[IDX(i, blockIdx.x * blockDim.x + threadIdx.x, outDim)];
+    }
+}
 
 __global__ void reLU(float *A, float *B, int numCols) {
     // 32 x 32 threads per block
     B[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] = fmaxf(A[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)], 0.0f);
+}
+
+__global__ void reLUGrad(float *dZI, float *dAI, float *ZI, int batchSize, int outDim) {
+    int index = IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, outDim);
+    dZI[index] = dAI[index] * ((ZI[index] > EPS ? 1 : 0));
 }
 
 void cpuMatMul(float *A, float *B, float *C, int P, int Q, int R, bool aTrans = false, bool bTrans = false) {
@@ -179,7 +193,68 @@ float getLoss(float *m1, float *m2, int numRows, int numCols) {
     return sum;
 }
 
+void initBPCPU(float *Z, float *Y, float *dZ, int numRows, int numCols) {
+    for (int i=0; i < numRows; i++) {
+        for (int j=0; j < numCols; j++) {
+            dZ[i * numCols + j] = 2 * (Z[i * numCols + j] - Y[i * numCols + j]);
+            dZ[i * numCols + j] = dZ[i * numCols + j]/numRows;
+            dZ[i * numCols + j] = dZ[i * numCols + j]/numCols;
+        }
+    }
+}
 
+void lastLayerBPCPU(float *dZ, float *A, float *W, float *dW, float *dB, float *dA, int batchSize, int outDim, int inDim) {
+    cpuMatMul(A, dZ, dW, inDim, batchSize, outDim, true, false);
+    for (int j=0; j < outDim; j++) {
+        dB[j] = 0;
+        for (int i=0; i < batchSize; i++) {
+            dB[j] += dZ[i * outDim + j];
+        }
+    }
+    if (dA != nullptr) {
+        cpuMatMul(dZ, W, dA, batchSize, outDim, inDim, false, true);
+    }
+}
+
+void lastLayerBPGPU(float *dZ, float *A, float *W, float *dW, float *dB, float *dA, int batchSize, int outDim, int inDim) {
+    // First up, calculate dW = A^TdZ
+    // dW -> inDim, outDim. A -> batchSize * inDim, dZ -> batchSize * outDim
+    dim3 block(32, 32);
+    dim3 grid1(((outDim + block.x - 1)/block.x), ((inDim + block.y - 1)/block.y));
+    matmul<<<grid1, block>>>(A, dZ, dW, inDim, batchSize, outDim, true, false);
+    // Next bias gradient
+    dim3 block2(32,1);
+    dim3 grid2(((outDim + block2.x - 1)/block2.x), 1);
+    biasGradientGPU<<<grid2, block2>>>(dB, dZ, outDim, batchSize);
+    // Finally, dA = dZW^T
+    if (dA != nullptr) {
+        dim3 grid3(((inDim + block.x - 1)/block.x), ((batchSize + block.y - 1)/block.y));
+        matmul<<<grid3, block>>>(dZ, W, dA, batchSize, outDim, inDim, false, true);
+    }
+}
+
+void bpLayerICPU(float *dAI, float *dZI, float *dWI, float *dBI, float *dAIMinus1, float *ZI, float *AIMinus1, float *WI, int batchSize, int outDim, int inDim) {
+    // Given: dAI, ZI, AIMinus1, WI
+    // To compute: dZI, dWI, dBI, dAIMinus1
+    // dZI, ZI, dAI -> batchSize * outDim
+    // dAIMinus1, AIMinus1 -> batchSize * inDim
+    // dWI, WI -> inDim * outDim
+    // dBI -> outDim * 1
+    // first, dZI = dAI * (ZI > 0)
+    for (int i=0; i < batchSize; i++) {
+        for (int j=0; j < outDim; j++) {
+            dZI[i * outDim + j] = dAI[i * outDim + j] * ((ZI[i * outDim + j] > EPS ? 1 : 0));
+        }
+    }
+    lastLayerBPCPU(dZI, AIMinus1, WI, dWI, dBI, dAIMinus1, batchSize, outDim, inDim);
+}
+
+void bpLayerIGPU(float *dAI, float *dZI, float *dWI, float *dBI, float *dAIMinus1, float *ZI, float *AIMinus1, float *WI, int batchSize, int outDim, int inDim) {
+    dim3 block(32, 32);
+    dim3 grid(((outDim + block.x - 1)/block.x), ((batchSize + block.y - 1)/block.y));
+    reLUGrad<<<grid, block>>>(dZI, dAI, ZI, batchSize, outDim);
+    lastLayerBPGPU(dZI, AIMinus1, WI, dWI, dBI, dAIMinus1, batchSize, outDim, inDim);
+}
 
 int main(int argc, char **argv) {
     if (argc != 2) {
@@ -282,6 +357,7 @@ int main(int argc, char **argv) {
     std::cout << "Begin: Copy to GPU" << std::endl;
     #endif
     cudaMemcpy(inputGPU, input, N * IN * sizeof(float), cudaMemcpyDefault);
+    cudaMemcpy(outputGPU, output, N * OUT * sizeof(float), cudaMemcpyDefault);
     cudaMemcpy(WGPU[0], W[0], H[0] * IN * sizeof(float), cudaMemcpyDefault);
     cudaMemcpy(WGPU[L-1], W[L-1], H[L-2] * OUT * sizeof(float), cudaMemcpyDefault);
     cudaMemcpy(BGPU[0], B[0], H[0] * sizeof(float), cudaMemcpyDefault);
@@ -500,72 +576,164 @@ int main(int argc, char **argv) {
         std::cout << "Forward pass correct" << std::endl;
 
         // Now for backward pass
+        #ifdef DEBUG_PRINT
         float *dW[L];
         float *dWCpy[L];
-        float *dWGPU[L];
         float *dB[L];
         float *dBCpy[L];
-        float *dBGPU[L];
         
         float *dZ[L-1];
         float *dZCpy[L-1];
-        float *dZGPU[L-1];
         float *dA[L-1];
         float *dACpy[L-1];
-        float *dAGPU[L-1];
-
+        
         float *dpred;
         float *dpredCpy;
-        float *dpredGPU;
+        #endif 
 
+        float *dWGPU[L];
+        float *dBGPU[L];
+        float *dZGPU[L-1];
+        float *dAGPU[L-1];
+        float *dpredGPU;
+        
+        #ifdef DEBUG_PRINT
         dW[0] = new float[IN * H[0]];
+        dWCpy[0] = new float[IN * H[0]];
         dW[L-1] = new float[H[L-2] * OUT];
+        dWCpy[L-1] = new float[H[L-2] * OUT];
         dB[0] = new float[H[0]];
+        dBCpy[0] = new float[H[0]];
         dB[L-1] = new float[OUT];
+        dBCpy[L-1] = new float[OUT];
+        #endif
+
         cudaMalloc(&dWGPU[0], IN * H[0] * sizeof(float));
         cudaMalloc(&dWGPU[L-1], H[L-2] * OUT * sizeof(float));
         cudaMalloc(&dBGPU[0], H[0] * sizeof(float));
         cudaMalloc(&dBGPU[L-1], OUT * sizeof(float));
-        for (int i=1; i < L; i++) {
+        for (int i=1; i < L - 1; i++) {
+            #ifdef DEBUG_PRINT
             dW[i] = new float[H[i-1] * H[i]];
             dWCpy[i] = new float[H[i-1] * H[i]];
             dB[i] = new float[H[i]];
             dBCpy[i] = new float[H[i]];
+            #endif
             cudaMalloc(&dWGPU[i], H[i-1] * H[i] * sizeof(float));
             cudaMalloc(&dBGPU[i], H[i] * sizeof(float));
         }
         for (int i=0; i < L-1; i++) {
+            #ifdef DEBUG_PRINT
             dZ[i] = new float[N * H[i]];
             dZCpy[i] = new float[N * H[i]];
             dA[i] = new float[N * H[i]];
             dACpy[i] = new float[N * H[i]];
+            #endif
             cudaMalloc(&dZGPU[i], N * H[i] * sizeof(float));
             cudaMalloc(&dAGPU[i], N * H[i] * sizeof(float));
         }
+        #ifdef DEBUG_PRINT
         dpred = new float[N * OUT];
         dpredCpy = new float[N * OUT];
+        #endif
         cudaMalloc(&dpredGPU, N * OUT * sizeof(float));
-        
 
+        // CPU Gradient Descent
+        #ifdef DEBUG_PRINT
+        initBPCPU(pred, output, dpred, N, OUT);
+        lastLayerBPCPU(dpred, A[L-2], W[L-1], dW[L-1], dB[L-1], dA[L-2],N, OUT, H[L-2]);
+        for (int l = L - 2; l >= 0; l--) {
+            if (l != 0) {
+                bpLayerICPU(dA[l],dZ[l],dW[l],dB[l],dA[l-1],Z[l],A[l-1],W[l],N,H[l],H[l-1]);
+            }
+            else {
+                bpLayerICPU(dA[l],dZ[l],dW[l],dB[l],nullptr,Z[l],input,W[l],N,H[l],IN);
+            }
+        }
+        #endif
 
+        // GPU Gradient Descent
+        dim3 block(32, 32);
+        dim3 grid1(((OUT + block.x - 1)/block.x), ((N + block.y - 1)/block.y));
+        bpInit<<<grid1, block>>>(predGPU, outputGPU, dpredGPU, OUT, N);
+        #ifdef DEBUG_PRINT
+        cudaMemcpy(dpredCpy, dpredGPU, N * OUT * sizeof(float), cudaMemcpyDefault);
+        if (!checkMatch(dpred, dpredCpy, N, OUT, "dPred")) {exit(1);}
+        lastLayerBPGPU(dpredGPU, AGPU[L-2], WGPU[L-1],dWGPU[L-1],dBGPU[L-1],dAGPU[L-2],N, OUT, H[L-2]);
+        cudaMemcpy(dWCpy[L-1], dWGPU[L-1], H[L-2] * OUT * sizeof(float), cudaMemcpyDefault);
+        if (!checkMatch(dW[L-1],dWCpy[L-1],H[L-2], OUT, "dW[L-1]")) {exit(1);}
+        cudaMemcpy(dBCpy[L-1], dBGPU[L-1], OUT * sizeof(float), cudaMemcpyDefault);
+        if (!checkMatch(dB[L-1],dBCpy[L-1],1, OUT, "dB[L-1]")) {exit(1);}
+        cudaMemcpy(dACpy[L-2], dAGPU[L-2], N * H[L-2] * sizeof(float), cudaMemcpyDefault);
+        if (!checkMatch(dA[L-2],dACpy[L-2],N, H[L-2], "dA[L-2]")) {exit(1);}
+        #endif
+        for (int l = L-2; l >= 0; l--) {
+            if (l != 0) {
+                bpLayerIGPU(dAGPU[l], dZGPU[l], dWGPU[l], dBGPU[l], dAGPU[l-1], ZGPU[l], AGPU[l-1], WGPU[l], N, H[l], H[l-1]);
+            }
+            else {
+                bpLayerIGPU(dAGPU[l], dZGPU[l], dWGPU[l], dBGPU[l],nullptr, ZGPU[l], inputGPU, WGPU[l], N, H[l], IN);
+            }
+            #ifdef DEBUG_PRINT
+            cudaMemcpy(dZCpy[l], dZGPU[l], sizeof(float) * N * H[l], cudaMemcpyDefault);
+            if (!checkMatch(dZ[l], dZCpy[l],N, H[l], "dZ[l]")) {exit(1);}
+            if (l != 0) {
+                cudaMemcpy(dWCpy[l], dWGPU[l], H[l-1] * H[l] * sizeof(float), cudaMemcpyDefault);
+                if (!checkMatch(dW[l], dWCpy[l], H[l-1], H[l], "dW[l]")) {exit(1);}
+            }
+            else {
+                cudaMemcpy(dWCpy[l], dWGPU[l], IN * H[l] * sizeof(float), cudaMemcpyDefault);
+                if (!checkMatch(dW[l], dWCpy[l], IN, H[l], "dW[l]")) {exit(1);}
+            }
+            cudaMemcpy(dBCpy[l], dBGPU[l], H[l] * sizeof(float), cudaMemcpyDefault);
+            if (!checkMatch(dB[l], dBCpy[l], H[l],1, "dB[l]")) {exit(1);}
+            if (l != 0) {
+                cudaMemcpy(dACpy[l-1], dAGPU[l-1], N * H[l-1] * sizeof(float), cudaMemcpyDefault);
+                if (!checkMatch(dA[l-1], dACpy[l-1], N, H[l-1], "dA[l-1]")) {exit(1);}
+            }
+            #endif
+        }
+        std::cout << "Gradient calculation correct!" << std::endl;
+
+        #ifdef DEBUG_PRINT
+        for (int i=0; i < L-1; i++) {
+            delete []Z[i];
+            delete []ZCpy[i];
+            delete []A[i];
+            delete []ACpy[i];
+        }
+        delete []pred;
+        delete []predCpy;
+        #endif
+        for (int i=0; i < L-1; i++) {
+            cudaFree(AGPU[i]);
+            cudaFree(ZGPU[i]);
+        }
+        cudaFree(predGPU);
         for (int i=0; i < L; i++) {
+            #ifdef DEBUG_PRINT
             delete []dW[i];
             delete []dWCpy[i];
             delete []dB[i];
             delete []dBCpy[i];
+            #endif
             cudaFree(dWGPU[i]);
             cudaFree(dBGPU[i]);
         }
         for (int i=0; i < L-1; i++) {
+            #ifdef DEBUG_PRINT
             delete []dZ[i];
             delete []dZCpy[i];
             delete []dA[i];
             delete []dACpy[i];
+            #endif
             cudaFree(dZGPU[i]);
             cudaFree(dAGPU[i]);
         }
+        #ifdef DEBUG_PRINT
         delete []dpred;
         delete []dpredCpy;
+        #endif
         cudaFree(dpredGPU);
 
     }
