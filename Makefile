@@ -6,7 +6,7 @@ LIBS        := -lcublas
 BIN_DIR     := bins
 
 # Define targets explicitly based on source files
-SRCS        := partA.cu
+SRCS        := partA.cu partB.cu
 TARGETS     := $(SRCS:%.cu=$(BIN_DIR)/%.bin)
 
 # Default target
@@ -20,10 +20,11 @@ $(BIN_DIR)/%.bin: %.cu | $(BIN_DIR)
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
-.PHONY: all clean partA
+.PHONY: all clean partA partB
 
 # Shortcuts to build specific files
 partA: $(BIN_DIR)/partA.bin
+partB: $(BIN_DIR)/partB.bin
 
 clean:
 	rm -rf $(BIN_DIR)
