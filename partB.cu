@@ -322,7 +322,7 @@ float randUni(int fanIn) {
 
 int main(int argc, char **argv) {
     if (argc != 2) {
-        std::cerr << "Usage: ./partA <Mode: 0 -> FP-only 1 -> Transpose matmul testing 2 -> Gradient check 3 -> Backpropagation 1>" << std::endl;
+        std::cerr << "Usage: ./partA <Mode: 0 -> FP-only 1 -> Transpose matmul testing 2 -> Gradient check 3 -> Backpropagation 1 4 -> Backpropagation with checkpointing>" << std::endl;
         return 1;       
     }   
     // Common part is setting up input, output, weight
