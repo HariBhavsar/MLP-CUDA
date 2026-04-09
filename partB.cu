@@ -12,11 +12,12 @@ using namespace std::chrono;
 const int H[L-1] = {2048, 2048, 2048};
 #define OUT 512
 #define EPS 0.001
+const float lr =0.001;
 
 #define IDX(Y,X,N) ((((Y) * (N)) + (X)))
 
 #define TILE_SIZE 32
-// #define DEBUG_PRINT
+#define DEBUG_PRINT
 
 __global__ void matmul(float* A, float* B, float* C, int P, int Q, int R, bool aTrans=false, bool bTrans=false) {
     // A is a PxQ matrix
@@ -70,6 +71,20 @@ __global__ void matVecSub(float *A, float* B, float *C, int numCols) {
     C[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] = A[IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, numCols)] - B[blockIdx.x * blockDim.x + threadIdx.x];
 }
 
+__global__ void weightedMatSub(float *A, float *B, float *C, float weight, int numCols) {
+    // Performs C = A - weight * B
+    int idxY = blockIdx.y * blockDim.y + threadIdx.y;
+    int idxX = blockIdx.x * blockDim.x + threadIdx.x;
+    C[IDX(idxY, idxX, numCols)] = A[IDX(idxY, idxX, numCols)] - weight * B[IDX(idxY, idxX, numCols)];
+}
+
+__global__ void weightedVecSub(float *A, float *B, float *C, float weight, int numElem) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numElem) {
+        C[idx] = A[idx] - weight * B[idx];
+    }
+}
+
 __global__ void biasGradientGPU(float *dB, float *dZ, int outDim, int batchSize) {
     // Assumption: 1D grid
     dB[blockIdx.x * blockDim.x + threadIdx.x] = 0;
@@ -86,6 +101,41 @@ __global__ void reLU(float *A, float *B, int numCols) {
 __global__ void reLUGrad(float *dZI, float *dAI, float *ZI, int batchSize, int outDim) {
     int index = IDX(blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x, outDim);
     dZI[index] = dAI[index] * ((ZI[index] > EPS ? 1 : 0));
+}
+
+__global__ void getGPULoss(float *output, float* pred, float* totalSum, int numRows, int numCols) {
+    int idxX = blockIdx.x * blockDim.x + threadIdx.x;
+    int idxY = blockIdx.y * blockDim.y + threadIdx.y;
+
+    float localVal = 0.0f;
+    if (idxX < numCols && idxY < numRows) {
+        localVal = pred[idxY * numCols + idxX] - output[idxY * numCols + idxX];
+        localVal = (localVal * localVal) / (numRows * numCols);
+    }
+
+    __shared__ float partialSum[TILE_SIZE * TILE_SIZE];
+    
+    // Load to shared memory
+    int tid = threadIdx.y * TILE_SIZE + threadIdx.x;
+    partialSum[tid] = localVal;
+    
+    // 1. Sync after loading to shared memory
+    __syncthreads();
+
+    // 2. Flattened 1D Reduction (Simpler and avoids the X==0 hang)
+    // Treating 32x32 as 1024 threads
+    for (int stride = (TILE_SIZE * TILE_SIZE) / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partialSum[tid] += partialSum[tid + stride];
+        }
+        // Sync MUST be seen by all threads in the block
+        __syncthreads();
+    }
+
+    // 3. One thread per block updates global
+    if (tid == 0) {
+        atomicAdd(totalSum, partialSum[0]);
+    }
 }
 
 void cpuMatMul(float *A, float *B, float *C, int P, int Q, int R, bool aTrans = false, bool bTrans = false) {
@@ -256,9 +306,19 @@ void bpLayerIGPU(float *dAI, float *dZI, float *dWI, float *dBI, float *dAIMinus
     lastLayerBPGPU(dZI, AIMinus1, WI, dWI, dBI, dAIMinus1, batchSize, outDim, inDim);
 }
 
+float getLimit(int fanIn) {
+    return sqrt(6.0f / (float)fanIn);
+}
+
+// Helper for random float in range [-limit, limit]
+float randUni(int fanIn) {
+    float limit = getLimit(fanIn);
+    return ((float)rand() / (float)RAND_MAX) * 2.0f * limit - limit;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
-        std::cerr << "Usage: ./partA <Mode: 0 -> FP-only 1 -> Transpose matmul testing>" << std::endl;
+        std::cerr << "Usage: ./partA <Mode: 0 -> FP-only 1 -> Transpose matmul testing 2 -> Gradient check 3 -> Backpropagation 1>" << std::endl;
         return 1;       
     }   
     // Common part is setting up input, output, weight
@@ -327,26 +387,26 @@ int main(int argc, char **argv) {
     for (int l=0; l < L; l++) {
         if (l == 0) {
             for (int i = 0; i < H[0]; i++) {
-                for (int j=0; j < IN; j++) {
-                    W[l][j * H[0] + i] = (((float)(rand()))/((float)RAND_MAX));
+                for (int j = 0; j < IN; j++) {
+                    W[l][j * H[0] + i] = randUni(IN); // Use IN as fan-in
                 }
-                B[l][i] = (((float)(rand()))/((float)RAND_MAX));
+                B[l][i] = 0.0f; // Standard to start biases at 0
             }
         }
         else if (l < L - 1) {
-            for (int i=0; i < H[l]; i++) {
-                for (int j=0; j < H[l - 1]; j++) {
-                    W[l][j * H[l] + i] = (((float)(rand()))/((float)RAND_MAX));
+            for (int i = 0; i < H[l]; i++) {
+                for (int j = 0; j < H[l - 1]; j++) {
+                    W[l][j * H[l] + i] = randUni(H[l - 1]); // Use previous layer dim
                 }
-                B[l][i] = (((float)(rand()))/((float)RAND_MAX));
+                B[l][i] = 0.0f;
             }
         }
         else {
-            for (int i=0; i < OUT; i++) {
-                for (int j=0; j < H[L-2]; j++) {
-                    W[l][j * OUT + i] = (((float)(rand()))/((float)RAND_MAX));
+            for (int i = 0; i < OUT; i++) {
+                for (int j = 0; j < H[L - 2]; j++) {
+                    W[l][j * OUT + i] = randUni(H[L - 2]);
                 }
-                B[l][i] = (((float)(rand()))/((float)RAND_MAX));
+                B[l][i] = 0.0f;
             }
         }
     }
@@ -422,6 +482,17 @@ int main(int argc, char **argv) {
         fpLayerCPU(A[L-2], pred, nullptr, W[L-1],B[L-1],N, H[L-2],OUT, false);
         cudaMemcpy(predCpy, predGPU, N * OUT * sizeof(float), cudaMemcpyDefault);
         if (!checkMatch(pred, predCpy, N, OUT, "Final")) {exit(1);}
+        float loss = getLoss(output, pred, N, OUT);
+        float lossCpy = 0.0f;
+        float *lossGPU = nullptr;
+        cudaMalloc(&lossGPU, sizeof(float));
+        cudaMemset(lossGPU, 0, sizeof(float));
+        dim3 block(32, 32);
+        dim3 grid(((OUT + block.x - 1)/block.x), ((N + block.y - 1)/block.y));
+        getGPULoss<<<grid, block>>>(outputGPU, predGPU, lossGPU, N, OUT);
+        cudaMemcpy(&lossCpy, lossGPU, sizeof(float), cudaMemcpyDefault);
+        cudaFree(lossGPU);
+        std::cout << "Loss: " << loss << " GPU Loss: " << lossCpy << std::endl;
         #endif
         #ifdef DEBUG_PRINT
         for (int i=0; i < L-1; i++) {
@@ -656,10 +727,10 @@ int main(int argc, char **argv) {
         dim3 block(32, 32);
         dim3 grid1(((OUT + block.x - 1)/block.x), ((N + block.y - 1)/block.y));
         bpInit<<<grid1, block>>>(predGPU, outputGPU, dpredGPU, OUT, N);
+        lastLayerBPGPU(dpredGPU, AGPU[L-2], WGPU[L-1],dWGPU[L-1],dBGPU[L-1],dAGPU[L-2],N, OUT, H[L-2]);
         #ifdef DEBUG_PRINT
         cudaMemcpy(dpredCpy, dpredGPU, N * OUT * sizeof(float), cudaMemcpyDefault);
         if (!checkMatch(dpred, dpredCpy, N, OUT, "dPred")) {exit(1);}
-        lastLayerBPGPU(dpredGPU, AGPU[L-2], WGPU[L-1],dWGPU[L-1],dBGPU[L-1],dAGPU[L-2],N, OUT, H[L-2]);
         cudaMemcpy(dWCpy[L-1], dWGPU[L-1], H[L-2] * OUT * sizeof(float), cudaMemcpyDefault);
         if (!checkMatch(dW[L-1],dWCpy[L-1],H[L-2], OUT, "dW[L-1]")) {exit(1);}
         cudaMemcpy(dBCpy[L-1], dBGPU[L-1], OUT * sizeof(float), cudaMemcpyDefault);
@@ -736,6 +807,98 @@ int main(int argc, char **argv) {
         #endif
         cudaFree(dpredGPU);
 
+    }
+    else if (mode == 3) {
+        // Memory allocations for forward pass
+        float *ZGPU[L-1]; 
+        float *AGPU[L-1];
+        for (int i=0; i < L-1; i++) {
+            cudaMalloc(&ZGPU[i], N * H[i] * sizeof(float));
+            cudaMalloc(&AGPU[i], N * H[i] * sizeof(float));
+        }
+        float *predGPU = nullptr;
+        cudaMalloc(&predGPU, N * OUT * sizeof(float));
+
+        // Memory allocations for backward pass
+        float *dWGPU[L];
+        float *dBGPU[L];
+        float *dZGPU[L-1];
+        float *dAGPU[L-1];
+        float *dpredGPU;
+        float *lossGPU;
+        cudaMalloc(&dWGPU[0], IN * H[0] * sizeof(float));
+        cudaMalloc(&dWGPU[L-1], H[L-2] * OUT * sizeof(float));
+        cudaMalloc(&dBGPU[0], H[0] * sizeof(float));
+        cudaMalloc(&dBGPU[L-1], OUT * sizeof(float));
+        cudaMalloc(&dZGPU[0], N * H[0] * sizeof(float));
+        cudaMalloc(&dAGPU[0], N * H[0] * sizeof(float));
+        cudaMalloc(&lossGPU, sizeof(float));
+        for (int i=1; i < L - 1; i++) {
+            cudaMalloc(&dWGPU[i], H[i-1] * H[i] * sizeof(float));
+            cudaMalloc(&dBGPU[i], H[i] * sizeof(float));
+            cudaMalloc(&dZGPU[i], N * H[i] * sizeof(float));
+            cudaMalloc(&dAGPU[i], N * H[i] * sizeof(float));
+        }
+        cudaMalloc(&dpredGPU, N * OUT * sizeof(float));
+
+        // Forward pass
+        for (int pass = 0; pass < 100; pass++) {
+            fpLayerGPU(inputGPU, ZGPU[0], AGPU[0], WGPU[0], BGPU[0], N, IN, H[0]);
+            for (int i=1; i < L-1; i++) {
+                fpLayerGPU(AGPU[i-1],ZGPU[i],AGPU[i],WGPU[i],BGPU[i],N,H[i-1],H[i]);
+            } 
+            fpLayerGPU(AGPU[L-2], predGPU, nullptr, WGPU[L-1], BGPU[L-1],N, H[L-2], OUT, false);
+            // Forward pass ends here
+            
+            //  Get loss
+            dim3 block(32, 32);
+            dim3 grid1(((OUT + block.x - 1)/block.x), ((N + block.y - 1)/block.y));
+            cudaMemset(lossGPU, 0, sizeof(float));
+            getGPULoss<<<grid1, block>>>(outputGPU, predGPU, lossGPU, N, OUT);
+            float loss = 0;
+            cudaMemcpy(&loss, lossGPU, sizeof(float), cudaMemcpyDefault);
+            std::cout << "Iteration: " << pass << " Loss: " << loss << std::endl;
+
+            // Gradient calculation begins here
+            bpInit<<<grid1, block>>>(predGPU, outputGPU, dpredGPU, OUT, N);
+            lastLayerBPGPU(dpredGPU, AGPU[L-2], WGPU[L-1],dWGPU[L-1],dBGPU[L-1],dAGPU[L-2],N, OUT, H[L-2]);
+            for (int l = L-2; l > 0; l--) {
+                bpLayerIGPU(dAGPU[l], dZGPU[l], dWGPU[l], dBGPU[l], dAGPU[l-1], ZGPU[l], AGPU[l-1], WGPU[l], N, H[l], H[l-1]);
+            }
+            bpLayerIGPU(dAGPU[0], dZGPU[0], dWGPU[0], dBGPU[0],nullptr, ZGPU[0], inputGPU, WGPU[0], N, H[0], IN);
+
+            // Modify the weights here
+            dim3 grid0(((H[0] + block.x - 1)/block.x), ((IN + block.y - 1)/block.y));
+            weightedMatSub<<<grid0, block>>>(WGPU[0],dWGPU[0],WGPU[0],lr,H[0]);
+            
+            for (int i=1; i < L-1; i++) {
+                dim3 grid(((H[i] + block.x - 1)/block.x), ((H[i-1] + block.y - 1)/block.y));
+                weightedMatSub<<<grid, block>>>(WGPU[i], dWGPU[i], WGPU[i], lr, H[i]);
+            }
+            weightedMatSub<<<grid0, block>>>(WGPU[L-1], dWGPU[L-1], WGPU[L-1], lr, OUT);
+            for (int i=0; i < L-1; i++) {
+                dim3 block1(32,1);
+                dim3 grid(((H[i] + block1.x - 1)/block1.x), 1);
+                weightedVecSub<<<grid, block1>>>(BGPU[i], dBGPU[i], BGPU[i], lr, H[i]);
+            }
+        }
+
+        // Free all GPU memory
+        for (int i=0; i < L-1; i++) {
+            cudaFree(AGPU[i]);
+            cudaFree(ZGPU[i]);
+        }
+        cudaFree(predGPU);
+        for (int i=0; i < L; i++) {
+            cudaFree(dWGPU[i]);
+            cudaFree(dBGPU[i]);
+        }
+        for (int i=0; i < L-1; i++) {
+            cudaFree(dZGPU[i]);
+            cudaFree(dAGPU[i]);
+        }
+        cudaFree(dpredGPU);
+        cudaFree(lossGPU);
     }
     delete []input;
     delete []output;
