@@ -17,7 +17,11 @@ const float lr =0.001;
 #define IDX(Y,X,N) ((((Y) * (N)) + (X)))
 
 #define TILE_SIZE 32
-#define DEBUG_PRINT
+// #define DEBUG_PRINT
+
+__global__ void useless() {
+    ;
+}
 
 __global__ void matmul(float* A, float* B, float* C, int P, int Q, int R, bool aTrans=false, bool bTrans=false) {
     // A is a PxQ matrix
@@ -330,6 +334,9 @@ int main(int argc, char **argv) {
     #ifdef DEBUG_PRINT
     std::cout << "Begin: CPU Memory Allocation" << std::endl;
     #endif
+    dim3 b(32,32);
+    dim3 g(32, 32);
+    useless<<<g,b>>>();
     float *input = new float[N * IN];
     float *output = new float[N * OUT];
     float *W[L];
@@ -427,11 +434,16 @@ int main(int argc, char **argv) {
         cudaMemcpy(BGPU[i], B[i], H[i] * sizeof(float), cudaMemcpyDefault);
     }
     // DONE: COPY TO GPU
+    size_t freeMem, totMem;
+    cudaMemGetInfo(&freeMem, &totMem);
+    std::cout << "Free: " << freeMem << " tot: " << totMem << " allocated: " << totMem - freeMem << std::endl;
 
     #ifdef DEBUG_PRINT
     std::cout << "Begin: Actual computation" << std::endl;
     #endif
     int mode = std::stoi(argv[1]);
+    auto prev = high_resolution_clock::now();
+    
     if (mode == 0) {
         #ifdef DEBUG_PRINT
         float *Z[L-1];
@@ -840,6 +852,9 @@ int main(int argc, char **argv) {
             cudaMalloc(&dAGPU[i], N * H[i] * sizeof(float));
         }
         cudaMalloc(&dpredGPU, N * OUT * sizeof(float));
+        size_t freeMem, totMem;
+        cudaMemGetInfo(&freeMem, &totMem);
+        std::cout << "Free: " << freeMem << " tot: " << totMem << " allocated: " << totMem - freeMem << std::endl;
 
         // Forward pass
         for (int pass = 0; pass < 100; pass++) {
@@ -900,6 +915,137 @@ int main(int argc, char **argv) {
         cudaFree(dpredGPU);
         cudaFree(lossGPU);
     }
+    else if (mode == 4) {
+        // Memory allocations for forward pass
+        float *A2 = nullptr;
+        cudaMalloc(&A2, N * H[1] * sizeof(float));
+        float *predGPU = nullptr;
+        cudaMalloc(&predGPU, N * OUT * sizeof(float));
+        float *dWGPU[L];
+        float *dBGPU[L];
+        float *dZGPU[L-1];
+        float *dAGPU[L-1];
+        float *dpredGPU;
+        float *lossGPU;
+        cudaMalloc(&dWGPU[0], IN * H[0] * sizeof(float));
+        cudaMalloc(&dWGPU[L-1], H[L-2] * OUT * sizeof(float));
+        cudaMalloc(&dBGPU[0], H[0] * sizeof(float));
+        cudaMalloc(&dBGPU[L-1], OUT * sizeof(float));
+        cudaMalloc(&dZGPU[0], N * H[0] * sizeof(float));
+        cudaMalloc(&dAGPU[0], N * H[0] * sizeof(float));
+        cudaMalloc(&lossGPU, sizeof(float));
+        for (int i=1; i < L - 1; i++) {
+            cudaMalloc(&dWGPU[i], H[i-1] * H[i] * sizeof(float));
+            cudaMalloc(&dBGPU[i], H[i] * sizeof(float));
+            cudaMalloc(&dZGPU[i], N * H[i] * sizeof(float));
+            cudaMalloc(&dAGPU[i], N * H[i] * sizeof(float));
+        }
+        cudaMalloc(&dpredGPU, N * OUT * sizeof(float));
+        size_t freeMem, totMem;
+        cudaMemGetInfo(&freeMem, &totMem);
+        std::cout << "Free: " << freeMem << " tot: " << totMem << " allocated: " << totMem - freeMem << std::endl;
+
+
+        // Forward pass
+        for (int pass = 0; pass < 100; pass++) {
+            // Forward pass
+            {
+                float *ZGPU[L-1]; 
+                float *AGPU[L-1];
+                for (int i=0; i < L-1; i++) {
+                    cudaMalloc(&ZGPU[i], N * H[i] * sizeof(float));
+                    cudaMalloc(&AGPU[i], N * H[i] * sizeof(float));
+                }
+                
+                fpLayerGPU(inputGPU, ZGPU[0], AGPU[0], WGPU[0], BGPU[0], N, IN, H[0]);
+                for (int i=1; i < L-1; i++) {
+                    fpLayerGPU(AGPU[i-1],ZGPU[i],AGPU[i],WGPU[i],BGPU[i],N,H[i-1],H[i]);
+                } 
+                fpLayerGPU(AGPU[L-2], predGPU, nullptr, WGPU[L-1], BGPU[L-1],N, H[L-2], OUT, false);
+                // Forward pass ends here
+                cudaMemcpy(A2, AGPU[1], N * H[1] * sizeof(float), cudaMemcpyDefault);
+                
+                for (int i=0; i < L-1; i++) {
+                    cudaFree(AGPU[i]);
+                    cudaFree(ZGPU[i]);
+                }
+            }
+            // Forward pass ends
+            // Backward pass begins
+            {
+                // Memory allocations for backward pass
+                float *ZGPU[L-1]; 
+                float *AGPU[L-1];
+                for (int i=0; i < L-1; i++) {
+                    cudaMalloc(&ZGPU[i], N * H[i] * sizeof(float));
+                    cudaMalloc(&AGPU[i], N * H[i] * sizeof(float));
+                }
+                fpLayerGPU(inputGPU, ZGPU[0], AGPU[0], WGPU[0], BGPU[0], N, IN, H[0]); // Calculates ZGPU[0], AGPU[0]
+                fpLayerGPU(AGPU[0], ZGPU[1], nullptr, WGPU[1], BGPU[1], N, H[0], H[1], false); // Calculates ZGPU[1]
+                cudaMemcpy(AGPU[1], A2, N * H[1] * sizeof(float), cudaMemcpyDefault); // Gives AGPU[1]
+                for (int i=2; i < L-1; i++) {
+                    fpLayerGPU(AGPU[i-1], ZGPU[i], AGPU[i], WGPU[i], BGPU[i], N, H[i-1], H[i]); // Calculates ZGPU[2..L-2], AGPU[2...L-2]
+                }
+
+
+                //  Get loss
+                dim3 block(32, 32);
+                dim3 grid1(((OUT + block.x - 1)/block.x), ((N + block.y - 1)/block.y));
+                cudaMemset(lossGPU, 0, sizeof(float));
+                getGPULoss<<<grid1, block>>>(outputGPU, predGPU, lossGPU, N, OUT);
+                float loss = 0;
+                cudaMemcpy(&loss, lossGPU, sizeof(float), cudaMemcpyDefault);
+                std::cout << "Iteration: " << pass << " Loss: " << loss << std::endl;
+
+                // Gradient calculation begins here
+                bpInit<<<grid1, block>>>(predGPU, outputGPU, dpredGPU, OUT, N);
+                lastLayerBPGPU(dpredGPU, AGPU[L-2], WGPU[L-1],dWGPU[L-1],dBGPU[L-1],dAGPU[L-2],N, OUT, H[L-2]);
+                for (int l = L-2; l > 0; l--) {
+                    bpLayerIGPU(dAGPU[l], dZGPU[l], dWGPU[l], dBGPU[l], dAGPU[l-1], ZGPU[l], AGPU[l-1], WGPU[l], N, H[l], H[l-1]);
+                }
+                bpLayerIGPU(dAGPU[0], dZGPU[0], dWGPU[0], dBGPU[0],nullptr, ZGPU[0], inputGPU, WGPU[0], N, H[0], IN);
+
+                // Modify the weights here
+                dim3 grid0(((H[0] + block.x - 1)/block.x), ((IN + block.y - 1)/block.y));
+                weightedMatSub<<<grid0, block>>>(WGPU[0],dWGPU[0],WGPU[0],lr,H[0]);
+                
+                for (int i=1; i < L-1; i++) {
+                    dim3 grid(((H[i] + block.x - 1)/block.x), ((H[i-1] + block.y - 1)/block.y));
+                    weightedMatSub<<<grid, block>>>(WGPU[i], dWGPU[i], WGPU[i], lr, H[i]);
+                }
+                weightedMatSub<<<grid0, block>>>(WGPU[L-1], dWGPU[L-1], WGPU[L-1], lr, OUT);
+                for (int i=0; i < L-1; i++) {
+                    dim3 block1(32,1);
+                    dim3 grid(((H[i] + block1.x - 1)/block1.x), 1);
+                    weightedVecSub<<<grid, block1>>>(BGPU[i], dBGPU[i], BGPU[i], lr, H[i]);
+                }
+                for (int i=0; i < L-1; i++) {
+                    cudaFree(AGPU[i]);
+                    cudaFree(ZGPU[i]);
+                }
+            }            
+
+        }
+
+        // Free all GPU memory
+        for (int i=0; i < L; i++) {
+            cudaFree(dWGPU[i]);
+            cudaFree(dBGPU[i]);
+        }
+        for (int i=0; i < L-1; i++) {
+            cudaFree(dZGPU[i]);
+            cudaFree(dAGPU[i]);
+        }
+        cudaFree(dpredGPU);
+        cudaFree(lossGPU);
+        cudaFree(A2);
+        cudaFree(predGPU);
+    }
+    
+    auto curr = high_resolution_clock::now();
+    auto duration = duration_cast<microseconds>(curr - prev);
+    std::cout << "Time taken: " << duration.count() << " microseconds" << std::endl;
+    
     delete []input;
     delete []output;
     for (int i=0; i < L; i++) {
